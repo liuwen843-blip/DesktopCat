@@ -1,0 +1,7 @@
+2026/09/14-00:38:17.186 4ba0 Reusing MANIFEST F:\job-site\.webengine_storage\Local Storage\leveldb/MANIFEST-000001
+2026/09/14-00:38:17.186 4ba0 Recovering log #124
+2026/09/14-00:38:17.188 4ba0 Level-0 table #127: started
+2026/09/14-00:38:17.232 4ba0 Level-0 table #127: 756793 bytes OK
+2026/09/14-00:38:17.264 4ba0 Delete type=0 #124
+2026/09/14-00:40:15.140 5fdc Level-0 table #130: started
+2026/09/14-00:40:15.529 5fdc Level-0 table #130: 757440 bytes OK
