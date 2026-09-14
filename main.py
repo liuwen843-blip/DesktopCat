@@ -71,18 +71,29 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
 import math
 import json
 import time
+import random
 import ctypes
 import socket
 import threading
 from ctypes import wintypes
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-from PyQt5.QtCore import Qt, QCoreApplication, QPoint, QUrl, QObject, pyqtSlot, QTimer, QRectF
+from PyQt5.QtCore import (
+    Qt,
+    QCoreApplication,
+    QPoint,
+    QUrl,
+    QObject,
+    pyqtSlot,
+    pyqtSignal,
+    QTimer,
+    QRectF,
+)
 
 QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
 QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 
-from PyQt5.QtGui import QColor, QKeySequence, QCursor, QIcon
+from PyQt5.QtGui import QColor, QKeySequence, QCursor, QIcon, QPainter, QPen, QBrush, QFont
 from PyQt5.QtWidgets import (
     QApplication,
     QShortcut,
@@ -575,6 +586,315 @@ def set_cursor_pos(x, y):
     user32.SetCursorPos(int(x), int(y))
 
 
+# ---- 挂机连点器（独立子线程 + 全局热键 F8/F9 + 多点巡检）----
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+VK_F8 = 0x77
+VK_F9 = 0x78
+
+_CIRCLED_NUMS = (
+    "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
+    "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱", "⑲", "⑳",
+)
+
+
+def _mouse_left_down():
+    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+
+
+def _mouse_left_up():
+    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+
+def _jitter_ms(base_ms, enabled, pct_lo=0.10, pct_hi=0.20):
+    """在基础毫秒上叠加 ±10%~20% 微差，模拟人工节奏。"""
+    base = max(1, int(base_ms or 1))
+    if not enabled:
+        return base
+    pct = random.uniform(pct_lo, pct_hi)
+    noise = (random.random() + random.random() - 1.0)
+    delta = int(base * pct * noise)
+    return max(1, base + delta)
+
+
+def _normalize_clicker_points(raw):
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            x = int(round(float(item.get("x"))))
+            y = int(round(float(item.get("y"))))
+        except Exception:
+            continue
+        out.append({"x": x, "y": y})
+        if len(out) >= 30:
+            break
+    return out
+
+
+class ClickerPointMarker(QWidget):
+    """屏幕坐标处的穿透序号浮标。"""
+
+    def __init__(self, index, x, y, parent=None):
+        super().__init__(parent)
+        self._index = max(1, int(index))
+        self._label = (
+            _CIRCLED_NUMS[self._index - 1]
+            if self._index <= len(_CIRCLED_NUMS)
+            else str(self._index)
+        )
+        flags = (
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        transparent_input = getattr(Qt, "WindowTransparentForInput", None)
+        if transparent_input is not None:
+            flags |= transparent_input
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setFixedSize(30, 30)
+        self.move(int(x) - 15, int(y) - 15)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        # 金黄外圈 + 半透明芯
+        painter.setBrush(QBrush(QColor(20, 24, 32, 170)))
+        painter.setPen(QPen(QColor(255, 214, 64, 230), 2))
+        painter.drawEllipse(2, 2, 26, 26)
+        painter.setPen(QPen(QColor(0, 245, 212, 240)))
+        font = QFont("Segoe UI", 10, QFont.Bold)
+        painter.setFont(font)
+        painter.drawText(self.rect(), Qt.AlignCenter, self._label)
+        painter.end()
+
+
+class AutoClickerService(QObject):
+    """独立线程执行连点；主线程轮询热键。支持多点按序巡检。"""
+
+    statusChanged = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._done = 0
+        self._last_cfg = {
+            "mode": "tap",
+            "count": 100,
+            "infinite": False,
+            "holdMs": 80,
+            "intervalMs": 120,
+            "jitter": True,
+            "points": [],
+        }
+        self._f8_down = False
+        self._f9_down = False
+
+    def is_running(self):
+        with self._lock:
+            return bool(self._running)
+
+    def _emit_status(self, payload):
+        try:
+            self.statusChanged.emit(json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def update_config(self, cfg):
+        if not isinstance(cfg, dict):
+            return
+        merged = dict(self._last_cfg)
+        merged.update(cfg)
+        mode = "hold" if str(merged.get("mode") or "") == "hold" else "tap"
+        self._last_cfg = {
+            "mode": mode,
+            "count": max(1, min(99999, int(merged.get("count") or 100))),
+            "infinite": bool(merged.get("infinite")),
+            "holdMs": max(50, min(1000, int(merged.get("holdMs") or 80))),
+            "intervalMs": max(30, min(2000, int(merged.get("intervalMs") or 120))),
+            "jitter": merged.get("jitter", True) is not False,
+            "points": _normalize_clicker_points(merged.get("points")),
+        }
+
+    def start(self, cfg=None):
+        if cfg is not None:
+            self.update_config(cfg)
+        self.stop(silent=True)
+        self._stop.clear()
+        with self._lock:
+            self._running = True
+            self._done = 0
+        cfg_snapshot = dict(self._last_cfg)
+        cfg_snapshot["points"] = list(self._last_cfg.get("points") or [])
+        t = threading.Thread(
+            target=self._loop,
+            args=(cfg_snapshot,),
+            name="auto-clicker",
+            daemon=True,
+        )
+        self._thread = t
+        t.start()
+        pts = cfg_snapshot.get("points") or []
+        self._emit_status(
+            {
+                "state": "running",
+                "done": 0,
+                "total": cfg_snapshot.get("count"),
+                "infinite": bool(cfg_snapshot.get("infinite")),
+                "pointTotal": len(pts),
+                "pointIndex": 1 if pts else 0,
+            }
+        )
+
+    def stop(self, silent=False):
+        self._stop.set()
+        t = self._thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=1.5)
+        with self._lock:
+            was = self._running
+            done = self._done
+            self._running = False
+        self._thread = None
+        try:
+            _mouse_left_up()
+        except Exception:
+            pass
+        if not silent and was:
+            self._emit_status({"state": "stopped", "done": done})
+
+    def _sleep_ms(self, ms):
+        end_at = time.time() + (max(0, int(ms)) / 1000.0)
+        while time.time() < end_at:
+            if self._stop.is_set():
+                return False
+            time.sleep(0.01)
+        return True
+
+    def _click_once(self, hold_ms, jitter):
+        press_ms = _jitter_ms(hold_ms, jitter)
+        _mouse_left_down()
+        ok = self._sleep_ms(press_ms)
+        try:
+            _mouse_left_up()
+        except Exception:
+            pass
+        return ok and (not self._stop.is_set())
+
+    def _move_to_point(self, point, jitter):
+        x = int(point.get("x") or 0)
+        y = int(point.get("y") or 0)
+        if jitter:
+            x += random.randint(-3, 3)
+            y += random.randint(-3, 3)
+        try:
+            set_cursor_pos(x, y)
+        except Exception as exc:
+            self._emit_status({"state": "error", "message": str(exc) or "move_failed"})
+            return False
+        # 落点后短暂停顿，避免过快点击
+        return self._sleep_ms(_jitter_ms(35, jitter, 0.08, 0.18) if jitter else 25)
+
+    def _loop(self, cfg):
+        mode = cfg.get("mode") or "tap"
+        infinite = bool(cfg.get("infinite"))
+        total = int(cfg.get("count") or 100)
+        hold_ms = int(cfg.get("holdMs") or 80)
+        interval_ms = int(cfg.get("intervalMs") or 120)
+        jitter = cfg.get("jitter", True) is not False
+        points = list(cfg.get("points") or [])
+        if mode == "tap":
+            hold_ms = min(hold_ms, max(50, hold_ms))
+        done = 0
+        point_i = 0
+        try:
+            while not self._stop.is_set():
+                if not infinite and done >= total:
+                    break
+
+                point_index = 0
+                if points:
+                    point = points[point_i % len(points)]
+                    point_index = (point_i % len(points)) + 1
+                    if not self._move_to_point(point, jitter):
+                        break
+                    point_i += 1
+
+                try:
+                    if not self._click_once(hold_ms, jitter):
+                        break
+                except Exception as exc:
+                    self._emit_status({"state": "error", "message": str(exc) or "click_failed"})
+                    break
+
+                done += 1
+                with self._lock:
+                    self._done = done
+                if done == 1 or done % 5 == 0 or points:
+                    self._emit_status(
+                        {
+                            "state": "running",
+                            "done": done,
+                            "total": total,
+                            "infinite": infinite,
+                            "mode": mode,
+                            "pointIndex": point_index,
+                            "pointTotal": len(points),
+                        }
+                    )
+
+                if self._stop.is_set():
+                    break
+                gap_ms = _jitter_ms(interval_ms, jitter)
+                if not self._sleep_ms(gap_ms):
+                    break
+
+            with self._lock:
+                self._running = False
+                self._done = done
+            if self._stop.is_set():
+                self._emit_status({"state": "stopped", "done": done})
+            else:
+                self._emit_status({"state": "done", "done": done, "total": total})
+        except Exception as exc:
+            with self._lock:
+                self._running = False
+            self._emit_status({"state": "error", "message": str(exc) or "loop_error"})
+        finally:
+            try:
+                _mouse_left_up()
+            except Exception:
+                pass
+
+    def poll_hotkeys(self):
+        """主线程定时：F8 启/停切换，F9 紧急中止。"""
+        try:
+            f8 = bool(user32.GetAsyncKeyState(VK_F8) & 0x8000)
+            f9 = bool(user32.GetAsyncKeyState(VK_F9) & 0x8000)
+        except Exception:
+            return
+        if f8 and not self._f8_down:
+            if self.is_running():
+                self.stop()
+            else:
+                self.start()
+        if f9 and not self._f9_down:
+            if self.is_running():
+                self.stop()
+        self._f8_down = f8
+        self._f9_down = f9
+
+
 class WindowBridge(QObject):
     """供页面 JS 调用。"""
 
@@ -680,26 +1000,168 @@ class WindowBridge(QObject):
             except Exception:
                 pass
 
+    @pyqtSlot(result=str)
+    def getClipboardText(self):
+        """供前端读取剪贴板（酒馆对话兜底）。"""
+        try:
+            clip = QApplication.clipboard()
+            if clip is None:
+                return ""
+            return str(clip.text() or "")
+        except Exception:
+            return ""
+
+    @pyqtSlot(str)
+    def startAutoClicker(self, cfg_json):
+        """启动挂机连点器（独立子线程）。"""
+        try:
+            cfg = json.loads(cfg_json) if cfg_json else {}
+        except Exception:
+            cfg = {}
+        try:
+            self._window.start_auto_clicker(cfg if isinstance(cfg, dict) else {})
+        except Exception:
+            pass
+
+    @pyqtSlot(str)
+    def updateAutoClickerConfig(self, cfg_json):
+        """仅更新连点参数（供 F8 使用），不立即启动。"""
+        try:
+            cfg = json.loads(cfg_json) if cfg_json else {}
+        except Exception:
+            cfg = {}
+        try:
+            svc = getattr(self._window, "_auto_clicker", None)
+            if svc is not None and isinstance(cfg, dict):
+                svc.update_config(cfg)
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def stopAutoClicker(self):
+        """紧急中止连点。"""
+        try:
+            self._window.stop_auto_clicker()
+        except Exception:
+            pass
+
+    @pyqtSlot(result=bool)
+    def isAutoClickerRunning(self):
+        try:
+            return bool(self._window.is_auto_clicker_running())
+        except Exception:
+            return False
+
+    @pyqtSlot(result=str)
+    def getCursorScreenPos(self):
+        """返回当前屏幕鼠标坐标 JSON。"""
+        try:
+            x, y = get_cursor_pos()
+            return json.dumps({"x": int(x), "y": int(y)})
+        except Exception:
+            return '{"x":0,"y":0}'
+
+    @pyqtSlot(str)
+    def syncClickerPointMarkers(self, points_json):
+        """在屏幕坐标处显示序号浮标。"""
+        try:
+            raw = json.loads(points_json) if points_json else []
+        except Exception:
+            raw = []
+        try:
+            self._window.sync_clicker_point_markers(raw if isinstance(raw, list) else [])
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def clearClickerPointMarkers(self):
+        try:
+            self._window.clear_clicker_point_markers()
+        except Exception:
+            pass
+
+
+class SettingsWindowBridge(QObject):
+    """设置子窗专用桥：关闭与无边框拖拽（不移动桌宠主窗）。"""
+
+    def __init__(self, settings_widget):
+        super().__init__()
+        self._win = settings_widget
+        self._offset = None
+
+    @pyqtSlot()
+    def closeSettings(self):
+        try:
+            self._win.hide()
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def close_window(self):
+        """前端自定义标题栏关闭入口。"""
+        self.closeSettings()
+
+    @pyqtSlot(int, int)
+    def beginDrag(self, screen_x, screen_y):
+        try:
+            top_left = self._win.frameGeometry().topLeft()
+            self._offset = QPoint(screen_x, screen_y) - top_left
+        except Exception:
+            self._offset = None
+
+    @pyqtSlot(int, int)
+    def dragTo(self, screen_x, screen_y):
+        if self._offset is None:
+            return
+        try:
+            self._win.move(QPoint(screen_x, screen_y) - self._offset)
+        except Exception:
+            pass
+
+    @pyqtSlot()
+    def endDrag(self):
+        self._offset = None
+
+    @pyqtSlot()
+    def notifySettingsChanged(self):
+        try:
+            pet = getattr(self._win, "_pet", None)
+            if pet is not None:
+                pet.broadcast_settings_changed()
+        except Exception:
+            pass
+
 
 class SettingsWidget(QWidget):
-    """独立设置窗口：系统标题栏可拖到任意屏幕位置。"""
+    """独立设置窗口：无边框 + 前端自定义标题栏拖拽/关闭。"""
 
     def __init__(self, profile, pet_window):
         super().__init__(None)
         self._pet = pet_window
         self.setWindowTitle("八条猫 · 设置")
-        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
-        self.resize(520, 680)
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setStyleSheet("background: transparent;")
+        self.resize(540, 720)
 
         self.view = QWebEngineView(self)
+        self.view.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.view.setStyleSheet("background: transparent;")
         page = QWebEnginePage(profile, self.view)
         self.view.setPage(page)
+        page.setBackgroundColor(QColor(Qt.transparent))
 
         settings = page.settings()
         apply_webengine_settings(settings)
 
+        self.bridge = SettingsWindowBridge(self)
         channel = QWebChannel(page)
-        channel.registerObject("bridge", pet_window.bridge)
+        channel.registerObject("bridge", self.bridge)
         page.setWebChannel(channel)
 
         layout = QVBoxLayout(self)
@@ -713,7 +1175,7 @@ class SettingsWidget(QWidget):
 
         esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
         esc.setContext(Qt.WindowShortcut)
-        esc.activated.connect(self.hide)
+        esc.activated.connect(self._on_escape)
 
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(
@@ -721,19 +1183,46 @@ class SettingsWidget(QWidget):
             screen.center().y() - self.height() // 2,
         )
 
-    def _on_load_finished(self, ok):
-        if not ok:
-            return
-        # 仅注入 QWebChannel，保持不透明设置页背景
+    def _on_escape(self):
+        # 优先交给页面关闭 cfg-modal；若无弹窗再隐藏设置窗
         self.view.page().runJavaScript(
             r"""
             (function () {
-              if (window.__settingsShellInjected) return;
-              window.__settingsShellInjected = true;
+              var m = document.getElementById('cfg-modal');
+              if (m && m.getAttribute('aria-hidden') === 'false') {
+                if (typeof closeCfgModal === 'function') { try { closeCfgModal(null); } catch (e) {} }
+                else {
+                  m.hidden = true;
+                  m.style.display = 'none';
+                  m.setAttribute('aria-hidden', 'true');
+                }
+                return true;
+              }
+              return false;
+            })();
+            """,
+            self._after_escape_js,
+        )
+
+    def _after_escape_js(self, closed_modal):
+        if not closed_modal:
+            self.hide()
+
+    def _on_load_finished(self, ok):
+        if not ok:
+            return
+        self.view.page().runJavaScript(
+            r"""
+            (function () {
               function connectBridge() {
                 if (typeof qt === 'undefined' || !qt.webChannelTransport) return;
                 new QWebChannel(qt.webChannelTransport, function (channel) {
                   window.bridge = channel.objects.bridge;
+                  try {
+                    if (typeof window.__bindSettingsWindowChrome === 'function') {
+                      window.__bindSettingsWindowChrome();
+                    }
+                  } catch (e) {}
                 });
               }
               if (typeof QWebChannel === 'undefined') {
@@ -885,6 +1374,15 @@ class PetWidget(QWidget):
         self._typing_timer.timeout.connect(self._poll_typing_activity)
         self._typing_timer.start()
 
+        # 挂机连点器：子线程执行 + F8/F9 热键轮询
+        self._auto_clicker = AutoClickerService(self)
+        self._auto_clicker.statusChanged.connect(self._on_auto_clicker_status)
+        self._clicker_hotkey_timer = QTimer(self)
+        self._clicker_hotkey_timer.setInterval(50)
+        self._clicker_hotkey_timer.timeout.connect(self._auto_clicker.poll_hotkeys)
+        self._clicker_hotkey_timer.start()
+        self._clicker_markers = []
+
         self._setup_tray()
 
     def _setup_tray(self):
@@ -986,6 +1484,57 @@ class PetWidget(QWidget):
             self._overlay_expanded = False
         self.move(cx - self.width() // 2, cy - self.height() // 2)
 
+    def start_auto_clicker(self, cfg):
+        if not hasattr(self, "_auto_clicker") or self._auto_clicker is None:
+            return
+        self._auto_clicker.start(cfg if isinstance(cfg, dict) else {})
+
+    def stop_auto_clicker(self):
+        if not hasattr(self, "_auto_clicker") or self._auto_clicker is None:
+            return
+        self._auto_clicker.stop()
+
+    def is_auto_clicker_running(self):
+        if not hasattr(self, "_auto_clicker") or self._auto_clicker is None:
+            return False
+        return bool(self._auto_clicker.is_running())
+
+    def clear_clicker_point_markers(self):
+        markers = getattr(self, "_clicker_markers", None) or []
+        self._clicker_markers = []
+        for m in markers:
+            try:
+                m.hide()
+                m.close()
+                m.deleteLater()
+            except Exception:
+                pass
+
+    def sync_clicker_point_markers(self, points):
+        """根据点位列表重建屏幕序号浮标。"""
+        self.clear_clicker_point_markers()
+        pts = _normalize_clicker_points(points)
+        for i, p in enumerate(pts):
+            try:
+                marker = ClickerPointMarker(i + 1, p["x"], p["y"], None)
+                marker.show()
+                marker.raise_()
+                self._clicker_markers.append(marker)
+            except Exception:
+                pass
+
+    def _on_auto_clicker_status(self, payload_json):
+        """把连点状态推回前端。"""
+        try:
+            safe = json.dumps(str(payload_json or ""), ensure_ascii=False)
+            js = (
+                "try{if(typeof window.__onClickerStatus==='function')"
+                "window.__onClickerStatus(JSON.parse(%s))}catch(e){}"
+            ) % safe
+            self.view.page().runJavaScript(js)
+        except Exception:
+            pass
+
     def set_pet_busy(self, busy):
         self._pet_busy = busy
         if busy:
@@ -1006,6 +1555,26 @@ class PetWidget(QWidget):
             except Exception:
                 return
         set_click_through(self._hwnd, enabled)
+
+    def _poll_click_through(self):
+        # 避让淡出时保持穿透
+        if self._avoiding:
+            self.set_click_through(True)
+            return
+        # 甩飞系统光标时保持穿透，避免窗口吞掉位移中的点击
+        if self._flinging:
+            self.set_click_through(True)
+            return
+        # 咬住/动画互动中强制捕获
+        if self._pet_busy or self._offset_dragging():
+            self.set_click_through(False)
+            return
+
+        pos = QCursor.pos()
+        local = self.mapFromGlobal(pos)
+        over_pet = self._hit_rect.contains(float(local.x()), float(local.y()))
+        # 在猫身上：捕获；透明区：穿透
+        self.set_click_through(not over_pet)
 
     def set_auto_hide_fullscreen(self, enabled):
         self._auto_hide_enabled = bool(enabled)
@@ -1182,26 +1751,6 @@ class PetWidget(QWidget):
             should_hide = False
         self._set_avoiding(should_hide)
 
-    def _poll_click_through(self):
-        # 避让淡出时保持穿透
-        if self._avoiding:
-            self.set_click_through(True)
-            return
-        # 甩飞系统光标时保持穿透，避免窗口吞掉位移中的点击
-        if self._flinging:
-            self.set_click_through(True)
-            return
-        # 咬住/动画互动中强制捕获
-        if self._pet_busy or self._offset_dragging():
-            self.set_click_through(False)
-            return
-
-        pos = QCursor.pos()
-        local = self.mapFromGlobal(pos)
-        over_pet = self._hit_rect.contains(float(local.x()), float(local.y()))
-        # 在猫身上：捕获；透明区：穿透
-        self.set_click_through(not over_pet)
-
     def _offset_dragging(self):
         return self.bridge._offset is not None
 
@@ -1370,6 +1919,8 @@ def main():
     app.aboutToQuit.connect(stop_local_http_server)
 
     widget = PetWidget()
+    app.aboutToQuit.connect(widget.stop_auto_clicker)
+    app.aboutToQuit.connect(widget.clear_clicker_point_markers)
     widget.show()
 
     sys.exit(app.exec_())
